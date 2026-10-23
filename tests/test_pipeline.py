@@ -14,7 +14,12 @@ from world_bank_pipeline.client import ApiPage, WorldBankApiError, WorldBankClie
 from world_bank_pipeline.config import PipelineConfig, load_config
 from world_bank_pipeline.pipeline import _indicator_names_from_raw, _new_run_id
 from world_bank_pipeline.quality import run_quality_checks
-from world_bank_pipeline.store import initialize_database, persist_raw_layer, publish_staging
+from world_bank_pipeline.store import (
+    initialize_database,
+    persist_raw_layer,
+    publish_staging,
+    record_ingestion_quality_metrics,
+)
 
 
 class WorldBankClientTests(unittest.TestCase):
@@ -100,6 +105,39 @@ class WorldBankClientTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
 
 class StoreTests(unittest.TestCase):
+    def test_ingestion_quality_metrics_capture_counts_nulls_and_each_run(self):
+        connection = initialize_database(":memory:")
+        connection.executemany(
+            "INSERT INTO sys.pipeline_runs VALUES (?, current_timestamp, NULL, 'running', NULL)",
+            [(1,), (2,)],
+        )
+        connection.execute("""INSERT INTO ing.raw_responses VALUES
+            (1, 'countries', NULL, NULL, 1, 'url', current_timestamp, 'hash', 'page.json')""")
+        connection.execute("""INSERT INTO ing.raw_indicator_observations VALUES
+            (1, 'BRA', 'TEST', 1, 0, '{\"date\":\"2020\",\"value\":null}',
+             'page.json', 'hash', 'url', current_timestamp),
+            (1, 'BRA', 'TEST', 1, 1, '{\"date\":\"2021\",\"value\":10}',
+             'page.json', 'hash', 'url', current_timestamp)""")
+        record_ingestion_quality_metrics(connection, 1)
+        record_ingestion_quality_metrics(connection, 2)
+
+        metrics = connection.execute("""
+            SELECT table_name, row_count, sql_null_count, sql_null_counts, json_value_null_count
+            FROM sys.ingestion_quality_metrics
+            WHERE run_id = 1 ORDER BY table_name
+        """).fetchall()
+        self.assertEqual(metrics[0], ("raw_country_metadata", 0, 0, "{}", 0))
+        self.assertEqual(metrics[1], ("raw_indicator_observations", 2, 0, "{}", 1))
+        self.assertEqual(metrics[2][:3], ("raw_responses", 1, 2))
+        self.assertEqual(json.loads(metrics[2][3]), {"country_code": 1, "indicator_code": 1})
+        self.assertEqual(metrics[2][4], 0)
+        self.assertEqual(metrics[3], ("run_observation_scope", 0, 0, "{}", 0))
+        self.assertEqual(
+            connection.execute("SELECT COUNT(*) FROM sys.ingestion_quality_metrics WHERE run_id=2").fetchone()[0],
+            4,
+        )
+        connection.close()
+
     def test_startup_restores_fact_lineage_without_rewriting_dimension_audit(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "lineage.duckdb"

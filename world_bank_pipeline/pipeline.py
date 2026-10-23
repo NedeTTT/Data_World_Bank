@@ -12,7 +12,12 @@ import duckdb
 from .client import ApiPage, WorldBankClient
 from .config import PipelineConfig
 from .quality import run_quality_checks
-from .store import initialize_database, persist_raw_layer, publish_staging
+from .store import (
+    initialize_database,
+    persist_raw_layer,
+    publish_staging,
+    record_ingestion_quality_metrics,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -109,6 +114,18 @@ def _export_reports(connection: duckdb.DuckDBPyConnection, reports_dir: Path, sq
             writer.writerow([column[0] for column in cursor.description])
             writer.writerows(cursor.fetchall())
 
+    cursor = connection.execute("""
+        SELECT run_id, table_name, row_count, sql_null_count,
+               sql_null_counts, json_value_null_count, measured_at
+        FROM sys.ingestion_quality_metrics
+        ORDER BY run_id DESC, table_name
+    """)
+    output_path = reports_dir / "ingestion_quality.csv"
+    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow([column[0] for column in cursor.description])
+        writer.writerows(cursor.fetchall())
+
 
 def run_pipeline(config: PipelineConfig) -> str:
     started_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -138,6 +155,7 @@ def run_pipeline(config: PipelineConfig) -> str:
             for year in range(config.start_year, config.end_year + 1)
         ]
         persist_raw_layer(connection, raw_rows, raw_country_rows, raw_observation_rows, observation_scope)
+        record_ingestion_quality_metrics(connection, run_id)
         publish_staging(
             connection, run_id, indicator_names,
             validator=lambda database: run_quality_checks(database, config),

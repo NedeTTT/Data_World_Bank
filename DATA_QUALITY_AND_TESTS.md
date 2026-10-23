@@ -6,6 +6,8 @@ This note explains, in non-technical terms, what the pipeline checks during a no
 
 These checks run after the data has been prepared for the analytics model and before the model update is committed. A failed blocking check stops publication of the new analytical batch. The raw API responses are retained for diagnosis.
 
+After raw ingestion, the pipeline also snapshots a quality profile for every `ing` table and run in `sys.ingestion_quality_metrics`. It records the number of rows, total SQL NULL cells, SQL NULLs per column, and JSON `value: null` observations separately. The same snapshot is exported to `reports/ingestion_quality.csv`, including tables that had zero rows in that run.
+
 1. **Expected coverage**  
    The pipeline calculates how many country × indicator × year combinations should exist from `config.toml`, then compares that with the fact table row count. This catches a partially built analytical set. Missing API values still count as rows because they are represented explicitly as `missing` or `incomplete`.
 
@@ -83,6 +85,9 @@ The tests use simulated API responses and temporary or in-memory DuckDB database
 
 16. **Standard dimension audit columns**
    Confirms country, indicator, and year dimensions have the same `run_id` and `load_start_date` types, and that the audit identity advances only when a dimension attribute changes.
+
+17. **Ingestion counts and NULL profile**
+   Checks per-run row counts for all ingestion tables, SQL NULL counts per nullable column, JSON `value: null` counts, and zero-row snapshots for empty tables.
 
 ## What a warning means
 

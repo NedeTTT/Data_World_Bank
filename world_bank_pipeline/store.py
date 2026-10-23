@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import json
 
 import duckdb
 
@@ -17,6 +18,16 @@ CREATE TABLE IF NOT EXISTS sys.pipeline_runs (
     finished_at TIMESTAMP,
     status VARCHAR NOT NULL,
     error_message VARCHAR
+);
+CREATE TABLE IF NOT EXISTS sys.ingestion_quality_metrics (
+    run_id BIGINT NOT NULL,
+    table_name VARCHAR NOT NULL,
+    row_count BIGINT NOT NULL,
+    sql_null_count BIGINT NOT NULL,
+    sql_null_counts JSON NOT NULL,
+    json_value_null_count BIGINT NOT NULL,
+    measured_at TIMESTAMP NOT NULL,
+    PRIMARY KEY (run_id, table_name)
 );
 CREATE TABLE IF NOT EXISTS ing.raw_responses (
     run_id BIGINT NOT NULL,
@@ -811,6 +822,68 @@ def persist_raw_layer(
             "INSERT INTO ing.run_observation_scope VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
             observation_scope,
         )
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+def record_ingestion_quality_metrics(
+    connection: duckdb.DuckDBPyConnection,
+    run_id: int,
+) -> None:
+    tables = (
+        "raw_responses",
+        "raw_country_metadata",
+        "raw_indicator_observations",
+        "run_observation_scope",
+    )
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        for table_name in tables:
+            columns = [
+                row[0] for row in connection.execute(
+                    """SELECT column_name FROM information_schema.columns
+                       WHERE table_schema='ing' AND table_name=? ORDER BY ordinal_position""",
+                    [table_name],
+                ).fetchall()
+            ]
+            null_expressions = ", ".join(
+                f"COUNT(*) FILTER (WHERE {column_name} IS NULL) AS {column_name}"
+                for column_name in columns
+            )
+            row = connection.execute(
+                f"""SELECT COUNT(*) AS row_count, {null_expressions}
+                    FROM ing.{table_name} WHERE run_id = ?""",
+                [run_id],
+            ).fetchone()
+            row_count = int(row[0])
+            null_counts = {
+                column_name: int(null_count)
+                for column_name, null_count in zip(columns, row[1:], strict=True)
+                if null_count
+            }
+            sql_null_count = sum(null_counts.values())
+            json_value_null_count = 0
+            if table_name == "raw_indicator_observations":
+                json_value_null_count = int(connection.execute(
+                    """SELECT COUNT(*) FROM ing.raw_indicator_observations
+                       WHERE run_id = ? AND json_type(payload_json, '$.value') = 'NULL'""",
+                    [run_id],
+                ).fetchone()[0])
+            connection.execute(
+                """INSERT INTO sys.ingestion_quality_metrics
+                   (run_id, table_name, row_count, sql_null_count, sql_null_counts,
+                    json_value_null_count, measured_at)
+                   VALUES (?, ?, ?, ?, ?::JSON, ?, current_timestamp)
+                   ON CONFLICT (run_id, table_name) DO UPDATE SET
+                       row_count = excluded.row_count,
+                       sql_null_count = excluded.sql_null_count,
+                       sql_null_counts = excluded.sql_null_counts,
+                       json_value_null_count = excluded.json_value_null_count,
+                       measured_at = excluded.measured_at""",
+                [run_id, table_name, row_count, sql_null_count, json.dumps(null_counts), json_value_null_count],
+            )
         connection.execute("COMMIT")
     except Exception:
         connection.execute("ROLLBACK")
