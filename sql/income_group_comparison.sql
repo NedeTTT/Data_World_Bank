@@ -15,11 +15,13 @@ SELECT
         ';' ORDER BY concat(o.country_code, ':', o.source_path, '#', coalesce(CAST(o.source_record_index AS VARCHAR), 'missing'), '@', o.source_response_sha256)
     ) FILTER (WHERE o.value IS NOT NULL) AS contributing_observation_lineage,
     STRING_AGG(
-        DISTINCT concat(c.country_code, ':', c.source_path, '#', c.source_page, ':', c.source_record_index, '@', c.source_response_sha256, '(', c.source_url, ')'),
-        ';' ORDER BY concat(c.country_code, ':', c.source_path, '#', c.source_page, ':', c.source_record_index, '@', c.source_response_sha256, '(', c.source_url, ')')
+        DISTINCT concat(c.country_code, ':', country_metadata.source_path, '#', country_metadata.source_page, ':', country_metadata.source_record_index, '@', country_metadata.source_response_sha256, '(', country_metadata.source_url, ')'),
+        ';' ORDER BY concat(c.country_code, ':', country_metadata.source_path, '#', country_metadata.source_page, ':', country_metadata.source_record_index, '@', country_metadata.source_response_sha256, '(', country_metadata.source_url, ')')
     ) AS income_group_metadata_lineage
 FROM mod.fact_indicator_observation AS o
 JOIN mod.dim_country AS c USING (country_code)
+LEFT JOIN stg.vw_country_source AS country_metadata
+    ON country_metadata.run_id = c.run_id AND country_metadata.country_code = c.country_code
 JOIN mod.dim_indicator AS i USING (indicator_code)
 JOIN mod.dim_year AS y USING (year)
 GROUP BY o.indicator_code, i.indicator_name, o.year, y.year, y.year_start, c.income_group_id, c.income_group_name

@@ -10,11 +10,10 @@ CREATE SCHEMA IF NOT EXISTS ing;
 CREATE SCHEMA IF NOT EXISTS sys;
 CREATE SCHEMA IF NOT EXISTS stg;
 CREATE SCHEMA IF NOT EXISTS mod;
-CREATE SCHEMA IF NOT EXISTS prl;
 CREATE SEQUENCE IF NOT EXISTS sys.pipeline_run_id_seq START 1;
 CREATE TABLE IF NOT EXISTS sys.pipeline_runs (
     run_id BIGINT PRIMARY KEY,
-    started_at TIMESTAMP NOT NULL,
+    load_start_date TIMESTAMP NOT NULL,
     finished_at TIMESTAMP,
     status VARCHAR NOT NULL,
     error_message VARCHAR
@@ -75,21 +74,21 @@ CREATE TABLE IF NOT EXISTS mod.dim_country (
     capital_city VARCHAR,
     longitude DOUBLE,
     latitude DOUBLE,
-    source_run_id BIGINT NOT NULL,
-    source_path VARCHAR NOT NULL,
-    source_page INTEGER NOT NULL,
-    source_record_index INTEGER NOT NULL,
-    source_response_sha256 VARCHAR NOT NULL,
-    source_url VARCHAR NOT NULL
+    run_id BIGINT NOT NULL,
+    load_start_date TIMESTAMP NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mod.dim_indicator (
     indicator_code VARCHAR PRIMARY KEY,
-    indicator_name VARCHAR NOT NULL
+    indicator_name VARCHAR NOT NULL,
+    run_id BIGINT NOT NULL,
+    load_start_date TIMESTAMP NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mod.dim_year (
     year VARCHAR PRIMARY KEY,
     decade VARCHAR NOT NULL,
-    year_start DATE NOT NULL
+    year_start DATE NOT NULL,
+    run_id BIGINT NOT NULL,
+    load_start_date TIMESTAMP NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mod.fact_indicator_observation (
     country_code VARCHAR NOT NULL,
@@ -113,7 +112,7 @@ CREATE OR REPLACE VIEW stg.vw_current_run AS
 SELECT run_id
 FROM sys.pipeline_runs
 WHERE status IN ('running', 'succeeded')
-QUALIFY ROW_NUMBER() OVER (ORDER BY started_at DESC, run_id DESC) = 1;
+QUALIFY ROW_NUMBER() OVER (ORDER BY load_start_date DESC, run_id DESC) = 1;
 
 CREATE OR REPLACE VIEW stg.vw_country AS
 SELECT
@@ -141,6 +140,23 @@ WHERE json_extract_string(payload_json, '$.id') = country_code
 QUALIFY ROW_NUMBER() OVER (
     PARTITION BY country_code
     ORDER BY fetched_at DESC, source_page, source_record_index, source_response_sha256
+) = 1;
+
+CREATE OR REPLACE VIEW stg.vw_country_source AS
+SELECT
+    run_id,
+    country_code,
+    source_path,
+    source_page,
+    source_record_index,
+    source_response_sha256,
+    source_url,
+    fetched_at
+FROM ing.raw_country_metadata AS raw
+WHERE json_extract_string(payload_json, '$.id') = country_code
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY run_id, country_code
+    ORDER BY source_page, source_record_index, source_response_sha256
 ) = 1;
 
 CREATE OR REPLACE VIEW stg.vw_indicator_observation AS
@@ -213,14 +229,52 @@ LEFT JOIN ing.raw_responses AS response
 def initialize_database(database_path: str) -> duckdb.DuckDBPyConnection:
     connection = duckdb.connect(database_path)
     connection.execute(SCHEMA)
-    _migrate_legacy_objects(connection)
     _migrate_legacy_run_table(connection)
+    _migrate_sys_pipeline_runs(connection)
+    _migrate_legacy_objects(connection)
     _remove_materialized_staging_tables(connection)
+    _migrate_dimensions(connection)
     _migrate_year_columns(connection)
     _migrate_fact_foreign_keys(connection)
     _restore_source_lineage(connection)
     connection.execute(STAGING_VIEWS)
     return connection
+
+
+def _migrate_sys_pipeline_runs(connection: duckdb.DuckDBPyConnection) -> None:
+    if not _table_exists(connection, "sys", "pipeline_runs"):
+        return
+    columns = {
+        row[0] for row in connection.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema='sys' AND table_name='pipeline_runs'"
+        ).fetchall()
+    }
+    if "load_start_date" in columns:
+        return
+    if "started_at" not in columns:
+        raise RuntimeError("sys.pipeline_runs needs started_at or load_start_date to migrate")
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        connection.execute("""
+            CREATE TABLE sys.pipeline_runs__load_start_migration (
+                run_id BIGINT PRIMARY KEY,
+                load_start_date TIMESTAMP NOT NULL,
+                finished_at TIMESTAMP,
+                status VARCHAR NOT NULL,
+                error_message VARCHAR
+            )
+        """)
+        connection.execute("""
+            INSERT INTO sys.pipeline_runs__load_start_migration
+            SELECT CAST(run_id AS BIGINT), started_at, finished_at, status, error_message
+            FROM sys.pipeline_runs
+        """)
+        connection.execute("DROP TABLE sys.pipeline_runs")
+        connection.execute("ALTER TABLE sys.pipeline_runs__load_start_migration RENAME TO pipeline_runs")
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def _migrate_legacy_objects(connection: duckdb.DuckDBPyConnection) -> None:
@@ -273,6 +327,123 @@ def _remove_materialized_staging_tables(connection: duckdb.DuckDBPyConnection) -
                 connection.execute(f"DROP TABLE {schema_name}.{table_name}")
 
 
+def _migrate_dimensions(connection: duckdb.DuckDBPyConnection) -> None:
+    expected_columns = {
+        "dim_country": {"country_code", "country_name", "run_id", "load_start_date"},
+        "dim_indicator": {"indicator_code", "indicator_name", "run_id", "load_start_date"},
+        "dim_year": {"year", "decade", "year_start", "run_id", "load_start_date"},
+    }
+    migrations = {}
+    for table_name, required in expected_columns.items():
+        if not _table_exists(connection, "mod", table_name):
+            continue
+        columns = {
+            row[0] for row in connection.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='mod' AND table_name=?",
+                [table_name],
+            ).fetchall()
+        }
+        audit_null_rows = 0
+        if {"run_id", "load_start_date"}.issubset(columns):
+            audit_null_rows = connection.execute(
+                f"SELECT COUNT(*) FROM mod.{table_name} WHERE run_id IS NULL OR load_start_date IS NULL"
+            ).fetchone()[0]
+        year_type = None
+        if table_name == "dim_year":
+            year_type = connection.execute(
+                "SELECT data_type FROM information_schema.columns WHERE table_schema='mod' AND table_name='dim_year' AND column_name='year'"
+            ).fetchone()[0]
+        if not required.issubset(columns) or audit_null_rows or year_type != ("VARCHAR" if table_name == "dim_year" else year_type):
+            migrations[table_name] = columns
+    if not migrations:
+        return
+
+    if _table_exists(connection, "mod", "fact_indicator_observation"):
+        connection.execute("""
+            INSERT INTO sys.pipeline_runs (run_id, load_start_date, finished_at, status, error_message)
+            SELECT CAST(source_run_id AS BIGINT), MIN(fetched_at), MIN(fetched_at), 'succeeded', NULL
+            FROM mod.fact_indicator_observation
+            GROUP BY CAST(source_run_id AS BIGINT)
+            ON CONFLICT (run_id) DO NOTHING
+        """)
+    earliest_run = "(SELECT run_id FROM sys.pipeline_runs ORDER BY load_start_date, run_id LIMIT 1)"
+    source_columns = {
+        "dim_country": (
+            "source_run_id", "source_path", "source_page", "source_record_index",
+            "source_response_sha256", "source_url",
+        ),
+        "dim_indicator": (),
+        "dim_year": (),
+    }
+
+    connection.execute("BEGIN TRANSACTION")
+    try:
+        for table_name, columns in migrations.items():
+            table = f"mod.{table_name}"
+            if "run_id" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN run_id BIGINT")
+            if "load_start_date" not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN load_start_date TIMESTAMP")
+
+            if "source_run_id" in columns:
+                preferred_run = "TRY_CAST(dimension.source_run_id AS BIGINT)"
+            elif table_name == "dim_country":
+                preferred_run = "(SELECT MIN(source_run_id) FROM mod.fact_indicator_observation WHERE country_code = dimension.country_code)"
+            elif table_name == "dim_indicator":
+                preferred_run = "(SELECT MIN(source_run_id) FROM mod.fact_indicator_observation WHERE indicator_code = dimension.indicator_code)"
+            else:
+                preferred_run = "(SELECT MIN(source_run_id) FROM mod.fact_indicator_observation WHERE year = CAST(dimension.year AS VARCHAR))"
+
+            connection.execute(f"""
+                UPDATE {table} AS dimension
+                SET run_id = COALESCE(
+                    (SELECT run_id FROM sys.pipeline_runs WHERE run_id = {preferred_run}),
+                    {earliest_run}
+                )
+                WHERE run_id IS NULL
+            """)
+            connection.execute(f"""
+                UPDATE {table} AS dimension
+                SET load_start_date = (
+                    SELECT load_start_date FROM sys.pipeline_runs WHERE run_id = dimension.run_id
+                )
+                WHERE load_start_date IS NULL
+            """)
+            missing_audit = connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE run_id IS NULL OR load_start_date IS NULL"
+            ).fetchone()[0]
+            if missing_audit:
+                raise RuntimeError(
+                    f"Cannot assign dimension audit columns for {missing_audit} rows in {table}"
+                )
+            has_fact_foreign_key = connection.execute(
+                """SELECT COUNT(*) FROM duckdb_constraints()
+                   WHERE schema_name='mod' AND referenced_table=?
+                     AND constraint_type='FOREIGN KEY'""",
+                [table_name],
+            ).fetchone()[0]
+            if not has_fact_foreign_key:
+                for column in source_columns[table_name]:
+                    if column in columns:
+                        connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        connection.execute("COMMIT")
+        for table_name in migrations:
+            table = f"mod.{table_name}"
+            has_fact_foreign_key = connection.execute(
+                """SELECT COUNT(*) FROM duckdb_constraints()
+                   WHERE schema_name='mod' AND referenced_table=?
+                     AND constraint_type='FOREIGN KEY'""",
+                [table_name],
+            ).fetchone()[0]
+            if not has_fact_foreign_key:
+                connection.execute(f"ALTER TABLE {table} ALTER COLUMN run_id SET NOT NULL")
+                connection.execute(f"ALTER TABLE {table} ALTER COLUMN load_start_date SET NOT NULL")
+    except Exception:
+        if connection.execute("SELECT current_transaction_id() IS NOT NULL").fetchone()[0]:
+            connection.execute("ROLLBACK")
+        raise
+
+
 def _migrate_year_columns(connection: duckdb.DuckDBPyConnection) -> None:
     definitions = {
         ("ing", "run_observation_scope"): (
@@ -282,8 +453,8 @@ def _migrate_year_columns(connection: duckdb.DuckDBPyConnection) -> None:
             "SELECT run_id, country_code, indicator_code, CAST(year AS VARCHAR) AS year FROM {source}",
         ),
         ("mod", "dim_year"): (
-            "CREATE TABLE {target} (year VARCHAR PRIMARY KEY, decade VARCHAR NOT NULL, year_start DATE NOT NULL)",
-            "SELECT CAST(year AS VARCHAR) AS year, CAST((year // 10) * 10 AS VARCHAR) || 's' AS decade, year_start FROM {source}",
+            "CREATE TABLE {target} (year VARCHAR PRIMARY KEY, decade VARCHAR NOT NULL, year_start DATE NOT NULL, run_id BIGINT NOT NULL, load_start_date TIMESTAMP NOT NULL)",
+            "SELECT CAST(year AS VARCHAR) AS year, CAST((TRY_CAST(year AS INTEGER) // 10) * 10 AS VARCHAR) || 's' AS decade, year_start, run_id, load_start_date FROM {source}",
         ),
         ("mod", "fact_indicator_observation"): (
             "CREATE TABLE {target} (country_code VARCHAR NOT NULL, indicator_code VARCHAR NOT NULL, "
@@ -320,7 +491,13 @@ def _migrate_year_columns(connection: duckdb.DuckDBPyConnection) -> None:
     ):
         connection.execute(f"DROP VIEW IF EXISTS {view_name}")
 
-    for (schema_name, table_name), (create_sql, select_sql) in definitions.items():
+    migration_order = (
+        ("ing", "run_observation_scope"),
+        ("mod", "fact_indicator_observation"),
+        ("mod", "dim_year"),
+    )
+    for schema_name, table_name in migration_order:
+        create_sql, select_sql = definitions[(schema_name, table_name)]
         if not _table_exists(connection, schema_name, table_name):
             continue
         year_type = connection.execute(
@@ -435,26 +612,6 @@ def _restore_source_lineage(connection: duckdb.DuckDBPyConnection) -> None:
         return
 
     connection.execute("""
-        UPDATE mod.dim_country AS dimension
-        SET source_run_id = raw.run_id,
-            source_path = raw.source_path,
-            source_page = raw.source_page,
-            source_record_index = raw.source_record_index,
-            source_url = raw.source_url
-        FROM (
-            SELECT run_id, country_code, source_path, source_page, source_record_index,
-                   source_response_sha256, source_url
-            FROM ing.raw_country_metadata
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY country_code, source_response_sha256
-                ORDER BY run_id, source_page, source_record_index
-            ) = 1
-        ) AS raw
-        WHERE dimension.country_code = raw.country_code
-          AND dimension.source_response_sha256 = raw.source_response_sha256
-    """)
-
-    connection.execute("""
         UPDATE mod.fact_indicator_observation AS fact
         SET source_run_id = raw.run_id,
             source_path = raw.source_path,
@@ -551,11 +708,18 @@ def _migrate_legacy_model_tables(connection: duckdb.DuckDBPyConnection) -> None:
         try:
             if country_exists:
                 connection.execute(f"""
-                    INSERT INTO mod.dim_country
+                    INSERT INTO mod.dim_country (
+                        country_code, country_name, region_id, region_name, income_group_id,
+                        income_group_name, lending_type_id, lending_type_name, capital_city,
+                        longitude, latitude, run_id, load_start_date
+                    )
                     SELECT country_code, country_name, region_id, region_name, income_group_id,
                            income_group_name, lending_type_id, lending_type_name, capital_city,
-                           longitude, latitude, source_run_id, source_path, source_page,
-                           source_record_index, source_response_sha256, source_url
+                           longitude, latitude,
+                           COALESCE((SELECT run_id FROM sys.pipeline_runs WHERE run_id=TRY_CAST(source_run_id AS BIGINT)),
+                                    (SELECT run_id FROM sys.pipeline_runs ORDER BY load_start_date, run_id LIMIT 1)),
+                           COALESCE((SELECT load_start_date FROM sys.pipeline_runs WHERE run_id=TRY_CAST(source_run_id AS BIGINT)),
+                                    (SELECT load_start_date FROM sys.pipeline_runs ORDER BY load_start_date, run_id LIMIT 1))
                     FROM {source_schema}.countries
                     ON CONFLICT (country_code) DO UPDATE SET
                         country_name = excluded.country_name, region_id = excluded.region_id,
@@ -563,22 +727,28 @@ def _migrate_legacy_model_tables(connection: duckdb.DuckDBPyConnection) -> None:
                         income_group_name = excluded.income_group_name,
                         lending_type_id = excluded.lending_type_id, lending_type_name = excluded.lending_type_name,
                         capital_city = excluded.capital_city, longitude = excluded.longitude,
-                        latitude = excluded.latitude, source_run_id = excluded.source_run_id,
-                        source_path = excluded.source_path, source_page = excluded.source_page,
-                        source_record_index = excluded.source_record_index,
-                        source_response_sha256 = excluded.source_response_sha256, source_url = excluded.source_url
+                        latitude = excluded.latitude, run_id = excluded.run_id,
+                        load_start_date = excluded.load_start_date
                 """)
             if indicator_exists:
                 connection.execute(f"""
-                    INSERT INTO mod.dim_indicator SELECT indicator_code, indicator_name
+                    INSERT INTO mod.dim_indicator (indicator_code, indicator_name, run_id, load_start_date)
+                    SELECT indicator_code, indicator_name,
+                           (SELECT run_id FROM sys.pipeline_runs ORDER BY load_start_date, run_id LIMIT 1),
+                           (SELECT load_start_date FROM sys.pipeline_runs ORDER BY load_start_date, run_id LIMIT 1)
                     FROM {source_schema}.indicators
-                    ON CONFLICT (indicator_code) DO UPDATE SET indicator_name = excluded.indicator_name
+                    ON CONFLICT (indicator_code) DO UPDATE SET
+                        indicator_name = excluded.indicator_name, run_id = excluded.run_id,
+                        load_start_date = excluded.load_start_date
                 """)
             if observation_exists:
                 connection.execute(f"""
-                    INSERT INTO mod.dim_year
+                    INSERT INTO mod.dim_year (year, decade, year_start, run_id, load_start_date)
                           SELECT DISTINCT CAST(year AS VARCHAR),
-                              CAST((year // 10) * 10 AS VARCHAR) || 's', make_date(year, 1, 1)
+                              CAST((CAST(year AS INTEGER) // 10) * 10 AS VARCHAR) || 's',
+                              make_date(CAST(year AS INTEGER), 1, 1),
+                              (SELECT run_id FROM sys.pipeline_runs ORDER BY load_start_date, run_id LIMIT 1),
+                              (SELECT load_start_date FROM sys.pipeline_runs ORDER BY load_start_date, run_id LIMIT 1)
                     FROM {source_schema}.observations
                     ON CONFLICT (year) DO NOTHING
                 """)
@@ -655,6 +825,9 @@ def publish_staging(
 ) -> None:
     connection.execute("BEGIN TRANSACTION")
     try:
+        load_start_date = connection.execute(
+            "SELECT load_start_date FROM sys.pipeline_runs WHERE run_id = ?", [run_id]
+        ).fetchone()[0]
         connection.execute(
             """DELETE FROM mod.fact_indicator_observation AS fact
             WHERE NOT EXISTS (
@@ -667,12 +840,37 @@ def publish_staging(
             )""",
             [run_id],
         )
+        country_columns = {
+            row[0] for row in connection.execute(
+                """SELECT column_name FROM information_schema.columns
+                   WHERE table_schema='mod' AND table_name='dim_country'"""
+            ).fetchall()
+        }
+        legacy_source_columns = (
+            "source_run_id", "source_path", "source_page", "source_record_index",
+            "source_response_sha256", "source_url",
+        )
+        retained_source_columns = [
+            column for column in legacy_source_columns if column in country_columns
+        ]
+        country_insert_columns = [
+            "country_code", "country_name", "region_id", "region_name", "income_group_id",
+            "income_group_name", "lending_type_id", "lending_type_name", "capital_city",
+            "longitude", "latitude", "run_id", "load_start_date", *retained_source_columns,
+        ]
+        country_select_columns = [
+            "country_code", "country_name", "region_id", "region_name", "income_group_id",
+            "income_group_name", "lending_type_id", "lending_type_name", "capital_city",
+            "longitude", "latitude", "run_id", "?", *retained_source_columns,
+        ]
+        legacy_updates = ",\n                ".join(
+            f"{column} = excluded.{column}" for column in retained_source_columns
+        )
+        if legacy_updates:
+            legacy_updates = ",\n                " + legacy_updates
         connection.execute(
-            """INSERT INTO mod.dim_country
-            SELECT country_code, country_name, region_id, region_name, income_group_id,
-                   income_group_name, lending_type_id, lending_type_name, capital_city,
-                   longitude, latitude, source_run_id, source_path, source_page,
-                   source_record_index, source_response_sha256, source_url
+            f"""INSERT INTO mod.dim_country ({', '.join(country_insert_columns)})
+            SELECT {', '.join(country_select_columns)}
             FROM stg.vw_country
             WHERE run_id = ?
             ON CONFLICT (country_code) DO UPDATE SET
@@ -681,9 +879,7 @@ def publish_staging(
                 income_group_name = excluded.income_group_name, lending_type_id = excluded.lending_type_id,
                 lending_type_name = excluded.lending_type_name, capital_city = excluded.capital_city,
                 longitude = excluded.longitude, latitude = excluded.latitude,
-                source_run_id = excluded.source_run_id, source_path = excluded.source_path,
-                source_page = excluded.source_page, source_record_index = excluded.source_record_index,
-                source_response_sha256 = excluded.source_response_sha256, source_url = excluded.source_url
+                run_id = excluded.run_id, load_start_date = excluded.load_start_date{legacy_updates}
             WHERE mod.dim_country.country_name IS DISTINCT FROM excluded.country_name
                OR mod.dim_country.region_id IS DISTINCT FROM excluded.region_id
                OR mod.dim_country.region_name IS DISTINCT FROM excluded.region_name
@@ -694,22 +890,24 @@ def publish_staging(
                OR mod.dim_country.capital_city IS DISTINCT FROM excluded.capital_city
                OR mod.dim_country.longitude IS DISTINCT FROM excluded.longitude
                OR mod.dim_country.latitude IS DISTINCT FROM excluded.latitude""",
-            [run_id],
+            [load_start_date, run_id],
         )
         connection.executemany(
-            """INSERT INTO mod.dim_indicator VALUES (?, ?)
-            ON CONFLICT (indicator_code) DO UPDATE SET indicator_name = excluded.indicator_name
+            """INSERT INTO mod.dim_indicator VALUES (?, ?, ?, ?)
+            ON CONFLICT (indicator_code) DO UPDATE SET
+                indicator_name = excluded.indicator_name, run_id = excluded.run_id,
+                load_start_date = excluded.load_start_date
             WHERE mod.dim_indicator.indicator_name IS DISTINCT FROM excluded.indicator_name""",
-            list(indicators.items()),
+            [(code, name, run_id, load_start_date) for code, name in indicators.items()],
         )
         connection.execute(
             """INSERT INTO mod.dim_year
                  SELECT DISTINCT CAST(year AS VARCHAR), CAST((CAST(year AS INTEGER) // 10) * 10 AS VARCHAR) || 's',
-                     make_date(CAST(year AS INTEGER), 1, 1)
+                     make_date(CAST(year AS INTEGER), 1, 1), run_id, ?
             FROM stg.vw_observation
             WHERE run_id = ?
             ON CONFLICT (year) DO NOTHING""",
-            [run_id],
+            [load_start_date, run_id],
         )
         connection.execute(
             """INSERT INTO mod.fact_indicator_observation

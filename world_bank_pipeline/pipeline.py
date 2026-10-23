@@ -116,7 +116,7 @@ def run_pipeline(config: PipelineConfig) -> str:
     connection = initialize_database(str(config.database_path))
     run_id = _new_run_id(connection)
     connection.execute(
-        "INSERT INTO sys.pipeline_runs (run_id, started_at, status) VALUES (?, ?, 'running')",
+        "INSERT INTO sys.pipeline_runs (run_id, load_start_date, status) VALUES (?, ?, 'running')",
         [run_id, started_at],
     )
     try:

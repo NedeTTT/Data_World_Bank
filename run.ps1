@@ -30,8 +30,16 @@ try {
     }
 
     & $venvPython -m world_bank_pipeline --config $config @args
-    if ($LASTEXITCODE -ne 0) {
-        throw 'World Bank pipeline failed.'
+    $pipelineExitCode = $LASTEXITCODE
+    if ($pipelineExitCode -ne 0) {
+        throw "World Bank pipeline failed with exit code $pipelineExitCode. Offline tests were not run."
+    }
+
+    & $venvPython (Join-Path $projectRoot 'run_tests.py')
+    $testExitCode = $LASTEXITCODE
+
+    if ($testExitCode -ne 0) {
+        throw "Offline tests failed with exit code $testExitCode. See reports/test-results.html."
     }
 } finally {
     Pop-Location

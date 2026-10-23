@@ -4,3 +4,4 @@ __pycache__/
 data/raw/
 data/*.duckdb
 data/*.wal
+reports/test-results*.html

@@ -18,6 +18,8 @@ These checks run after the data has been prepared for the analytics model and be
 4. **Every fact has its dimensions**  
    Every fact must refer to a country, indicator, and year that exist in the matching dimension tables. The check looks for unresolved references; database foreign keys enforce the same relationships when rows are written.
 
+   All three dimensions also carry the same audit fields, `run_id` and `load_start_date`. These identify the run that created or last changed a member (or its first insertion for `dim_year`). The run ID matches `sys.pipeline_runs`; DuckDB cannot enforce this relationship as a foreign key across schemas.
+
 5. **Source file still exists**  
    For every fact row, the raw JSON file recorded as its source must be present on disk. This helps ensure the value can be traced back to the API response.
 
@@ -26,13 +28,13 @@ These checks run after the data has been prepared for the analytics model and be
 
 ## Offline tests
 
-Run these separately with:
+Run the offline suite and generate/update the HTML report with:
 
 ```powershell
-python -m unittest discover -s tests -v
+python run_tests.py
 ```
 
-The tests use simulated API responses and temporary or in-memory DuckDB databases. They do not call the live World Bank API and are not automatically run by the production-style pipeline command.
+The tests use simulated API responses and temporary or in-memory DuckDB databases. They do not call the live World Bank API. `run.ps1` runs them after each pipeline attempt and writes the latest results to `reports/test-results.html`, plus a timestamped archive for each execution. Each report row explains the test in plain Romanian and shows its key assertion or representative SQL condition; technical failure details are expandable.
 
 1. **Sequential run IDs**  
    Confirms a new local database assigns run IDs in order (`1`, `2`, `3`, ...), which are also used to group each run's raw files and lineage.
@@ -78,6 +80,9 @@ The tests use simulated API responses and temporary or in-memory DuckDB database
 
 15. **Migrate numeric year columns and enforce relationships**  
     Starts with integer year keys, confirms values survive conversion to text while calendar dates stay dates, checks fact foreign keys, and verifies invalid country/indicator/year references are rejected.
+
+16. **Standard dimension audit columns**
+   Confirms country, indicator, and year dimensions have the same `run_id` and `load_start_date` types, and that the audit identity advances only when a dimension attribute changes.
 
 ## What a warning means
 

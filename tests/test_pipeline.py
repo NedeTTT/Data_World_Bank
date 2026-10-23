@@ -100,7 +100,7 @@ class WorldBankClientTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
 
 class StoreTests(unittest.TestCase):
-    def test_startup_restores_first_run_lineage_for_unchanged_payload(self):
+    def test_startup_restores_fact_lineage_without_rewriting_dimension_audit(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "lineage.duckdb"
             connection = initialize_database(str(database_path))
@@ -112,10 +112,10 @@ class StoreTests(unittest.TestCase):
                 ],
             )
             connection.execute("""INSERT INTO mod.dim_country VALUES
-                ('BRA', 'Brazil', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                 3, 'data/raw/3/country.json', 1, 0, 'same-country-hash', 'country-url')""")
-            connection.execute("INSERT INTO mod.dim_indicator VALUES ('TEST', 'Test indicator')")
-            connection.execute("INSERT INTO mod.dim_year VALUES ('2024', '2020s', DATE '2024-01-01')")
+                 ('BRA', 'Brazil', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                  3, TIMESTAMP '2026-10-23 12:00:00')""")
+            connection.execute("INSERT INTO mod.dim_indicator VALUES ('TEST', 'Test indicator', 3, TIMESTAMP '2026-10-23 12:00:00')")
+            connection.execute("INSERT INTO mod.dim_year VALUES ('2024', '2020s', DATE '2024-01-01', 3, TIMESTAMP '2026-10-23 12:00:00')")
             connection.execute("""INSERT INTO mod.fact_indicator_observation VALUES
                 ('BRA', 'TEST', '2024', 10.0, 'complete', 3, 'data/raw/3/indicator.json',
                  1, 0, 'same-indicator-hash', 'indicator-url', current_timestamp)""")
@@ -135,8 +135,8 @@ class StoreTests(unittest.TestCase):
             connection.close()
             repaired = initialize_database(str(database_path))
             self.assertEqual(
-                repaired.execute("SELECT source_run_id, source_path FROM mod.dim_country WHERE country_code='BRA'").fetchone(),
-                (1, "data/raw/1/country.json"),
+                repaired.execute("SELECT run_id, load_start_date FROM mod.dim_country WHERE country_code='BRA'").fetchone(),
+                (3, datetime(2026, 10, 23, 12, 0)),
             )
             self.assertEqual(
                 repaired.execute("SELECT source_run_id, source_path, value FROM mod.fact_indicator_observation WHERE country_code='BRA'").fetchone(),
@@ -146,6 +146,15 @@ class StoreTests(unittest.TestCase):
 
     def test_dimensions_and_facts_change_only_when_source_values_change(self):
         connection = initialize_database(":memory:")
+        for column_name, data_type in (
+            ("source_run_id", "BIGINT"),
+            ("source_path", "VARCHAR"),
+            ("source_page", "INTEGER"),
+            ("source_record_index", "INTEGER"),
+            ("source_response_sha256", "VARCHAR"),
+            ("source_url", "VARCHAR"),
+        ):
+            connection.execute(f"ALTER TABLE mod.dim_country ADD COLUMN {column_name} {data_type}")
         indicator_names = {"TEST": "Test indicator"}
         first_run = 1
         first_time = "2026-10-23T10:00:00+00:00"
@@ -153,6 +162,15 @@ class StoreTests(unittest.TestCase):
             "INSERT INTO sys.pipeline_runs VALUES (?, ?, ?, 'succeeded', NULL)",
             [first_run, "2026-10-23 10:00:00", "2026-10-23 10:01:00"],
         )
+        for table_name in ("dim_country", "dim_indicator", "dim_year"):
+            technical_columns = connection.execute(
+                """SELECT column_name, data_type FROM information_schema.columns
+                   WHERE table_schema = 'mod' AND table_name = ?
+                     AND column_name IN ('run_id', 'load_start_date')
+                   ORDER BY column_name""",
+                [table_name],
+            ).fetchall()
+            self.assertEqual(technical_columns, [("load_start_date", "TIMESTAMP"), ("run_id", "BIGINT")])
         bra_metadata = {
             "id": "BRA", "name": "Brazil", "region": {"id": "LAC", "value": "Latin America & Caribbean"},
             "incomeLevel": {"id": "UMC", "value": "Upper middle income"},
@@ -184,8 +202,17 @@ class StoreTests(unittest.TestCase):
         raw1 = raw_rows(first_run, "BRA", bra_metadata, 5, first_time)
         persist_raw_layer(connection, *raw1)
         publish_staging(connection, first_run, indicator_names)
+        legacy_lineage = connection.execute(
+            "SELECT source_run_id, source_path, source_page, source_record_index, source_response_sha256, source_url FROM mod.dim_country WHERE country_code='BRA'"
+        ).fetchone()
+        self.assertEqual(legacy_lineage[0], first_run)
+        self.assertTrue(all(value is not None for value in legacy_lineage))
         self.assertEqual(
-            connection.execute("SELECT source_run_id FROM mod.dim_country WHERE country_code='BRA'").fetchone()[0],
+            connection.execute("SELECT run_id, load_start_date FROM mod.dim_year WHERE year='2024'").fetchone(),
+            (first_run, datetime(2026, 10, 23, 10, 0)),
+        )
+        self.assertEqual(
+            connection.execute("SELECT run_id FROM mod.dim_country WHERE country_code='BRA'").fetchone()[0],
             first_run,
         )
         self.assertEqual(
@@ -203,7 +230,7 @@ class StoreTests(unittest.TestCase):
         persist_raw_layer(connection, *raw2_bra)
         publish_staging(connection, second_run, indicator_names)
         self.assertEqual(
-            connection.execute("SELECT source_run_id FROM mod.dim_country WHERE country_code='BRA'").fetchone()[0],
+            connection.execute("SELECT run_id FROM mod.dim_country WHERE country_code='BRA'").fetchone()[0],
             first_run,
         )
         self.assertEqual(
@@ -235,11 +262,11 @@ class StoreTests(unittest.TestCase):
         publish_staging(connection, third_run, indicator_names)
 
         self.assertEqual(
-            connection.execute("SELECT source_run_id FROM mod.dim_country WHERE country_code='BRA'").fetchone()[0],
+            connection.execute("SELECT run_id FROM mod.dim_country WHERE country_code='BRA'").fetchone()[0],
             first_run,
         )
         self.assertEqual(
-            connection.execute("SELECT source_run_id FROM mod.dim_country WHERE country_code='AUT'").fetchone()[0],
+            connection.execute("SELECT run_id FROM mod.dim_country WHERE country_code='AUT'").fetchone()[0],
             third_run,
         )
         self.assertEqual(
@@ -268,7 +295,7 @@ class StoreTests(unittest.TestCase):
             raw4_bra[2] + raw4_aut[2],
             raw4_bra[3] + raw4_aut[3],
         )
-        publish_staging(connection, fourth_run, indicator_names)
+        publish_staging(connection, fourth_run, {"TEST": "Updated test indicator"})
         self.assertEqual(
             connection.execute("SELECT source_run_id FROM mod.fact_indicator_observation WHERE country_code='BRA'").fetchone()[0],
             fourth_run,
@@ -278,12 +305,20 @@ class StoreTests(unittest.TestCase):
             7.0,
         )
         self.assertEqual(
-            connection.execute("SELECT source_run_id FROM mod.dim_country WHERE country_code='BRA'").fetchone()[0],
+            connection.execute("SELECT run_id FROM mod.dim_country WHERE country_code='BRA'").fetchone()[0],
             first_run,
         )
         self.assertEqual(
             connection.execute("SELECT source_run_id FROM mod.fact_indicator_observation WHERE country_code='AUT'").fetchone()[0],
             third_run,
+        )
+        self.assertEqual(
+            connection.execute("SELECT indicator_name, run_id FROM mod.dim_indicator WHERE indicator_code='TEST'").fetchone(),
+            ("Updated test indicator", fourth_run),
+        )
+        self.assertEqual(
+            connection.execute("SELECT run_id FROM mod.dim_year WHERE year='2024'").fetchone()[0],
+            first_run,
         )
         connection.close()
 
@@ -300,10 +335,10 @@ class StoreTests(unittest.TestCase):
             )
             connection = initialize_database(":memory:")
             connection.execute("""INSERT INTO mod.dim_country VALUES
-                ('BRA', 'Brazil', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                 1, 'raw.json', 1, 0, 'country-hash', 'country-url')""")
-            connection.execute("INSERT INTO mod.dim_indicator VALUES ('TEST', 'Test indicator')")
-            connection.execute("INSERT INTO mod.dim_year VALUES ('2020', '2020s', DATE '2020-01-01')")
+                 ('BRA', 'Brazil', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                  1, current_timestamp)""")
+            connection.execute("INSERT INTO mod.dim_indicator VALUES ('TEST', 'Test indicator', 1, current_timestamp)")
+            connection.execute("INSERT INTO mod.dim_year VALUES ('2020', '2020s', DATE '2020-01-01', 1, current_timestamp)")
             connection.execute("""INSERT INTO mod.fact_indicator_observation VALUES
                 ('BRA', 'TEST', '2020', NULL, 'complete', 1, 'raw.json', 1, 0,
                  'hash', 'url', current_timestamp)""")
@@ -329,9 +364,12 @@ class StoreTests(unittest.TestCase):
             connection = initialize_database(":memory:")
             connection.execute("""INSERT INTO mod.dim_country VALUES
                 ('BRA', 'Brazil', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                 1, 'raw.json', 1, 0, 'country-hash', 'country-url')""")
-            connection.executemany("INSERT INTO mod.dim_indicator VALUES (?, ?)", list(indicator_names.items()))
-            connection.execute("INSERT INTO mod.dim_year VALUES ('2020', '2020s', DATE '2020-01-01')")
+                 1, current_timestamp)""")
+            connection.executemany(
+                "INSERT INTO mod.dim_indicator VALUES (?, ?, 1, current_timestamp)",
+                list(indicator_names.items()),
+            )
+            connection.execute("INSERT INTO mod.dim_year VALUES ('2020', '2020s', DATE '2020-01-01', 1, current_timestamp)")
             observations = [
                 ("BRA", "SP.POP.TOTL", "2020", 100.0),
                 ("BRA", "NY.GDP.MKTP.CD", "2020", 1000.0),
@@ -347,10 +385,10 @@ class StoreTests(unittest.TestCase):
     def test_missing_report_includes_null_value_with_complete_status(self):
         connection = initialize_database(":memory:")
         connection.execute("""INSERT INTO mod.dim_country VALUES
-            ('BRA', 'Brazil', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-             1, 'country.json', 1, 0, 'country-hash', 'country-url')""")
-        connection.execute("INSERT INTO mod.dim_indicator VALUES ('TEST', 'Test indicator')")
-        connection.execute("INSERT INTO mod.dim_year VALUES ('2020', '2020s', DATE '2020-01-01')")
+              ('BRA', 'Brazil', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+               1, current_timestamp)""")
+        connection.execute("INSERT INTO mod.dim_indicator VALUES ('TEST', 'Test indicator', 1, current_timestamp)")
+        connection.execute("INSERT INTO mod.dim_year VALUES ('2020', '2020s', DATE '2020-01-01', 1, current_timestamp)")
         connection.execute("""INSERT INTO mod.fact_indicator_observation VALUES
             ('BRA', 'TEST', '2020', NULL, 'complete', 1, 'raw.json', 1, 0,
              'observation-hash', 'observation-url', current_timestamp)""")
@@ -463,8 +501,8 @@ class StoreTests(unittest.TestCase):
             (root / mexico_source_path).write_text("{}", encoding="utf-8")
             connection.execute("""INSERT INTO mod.dim_country VALUES
                 ('MEX', 'Mexico', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                 2, ?, 1, 0, 'old-country-hash', 'old-country-url')""", [mexico_source_path])
-            connection.execute("INSERT INTO mod.dim_year VALUES ('2017', '2010s', DATE '2017-01-01')")
+                  2, current_timestamp)""")
+            connection.execute("INSERT INTO mod.dim_year VALUES ('2017', '2010s', DATE '2017-01-01', 2, current_timestamp)")
             connection.execute("""INSERT INTO mod.fact_indicator_observation VALUES
                 ('MEX', 'TEST', '2017', 25.0, 'complete', 2, ?, 1, 0,
                  'old-observation-hash', 'old-observation-url', current_timestamp)""", [mexico_source_path])
@@ -508,12 +546,16 @@ class StoreTests(unittest.TestCase):
             config = load_config(Path(__file__).resolve().parents[1] / "config.toml")
             connection = duckdb.connect()
             connection = initialize_database(":memory:")
-            connection.execute("INSERT INTO mod.dim_country VALUES ('BRA', 'Brazil', NULL, NULL, 'UMC', 'Upper middle income', NULL, NULL, NULL, NULL, NULL, 1, 'country.json', 1, 0, 'country-hash', 'country-url')")
+            connection.execute("INSERT INTO sys.pipeline_runs VALUES (1, current_timestamp, current_timestamp, 'succeeded', NULL)")
+            connection.execute("INSERT INTO mod.dim_country VALUES ('BRA', 'Brazil', NULL, NULL, 'UMC', 'Upper middle income', NULL, NULL, NULL, NULL, NULL, 1, current_timestamp)")
+            connection.execute("""INSERT INTO ing.raw_country_metadata VALUES
+                (1, 'BRA', 1, 0, '{"id":"BRA","name":"Brazil"}', 'country.json',
+                 'country-hash', 'country-url', current_timestamp)""")
             for code, label in config.indicators.items():
-                connection.execute("INSERT INTO mod.dim_indicator VALUES (?, ?)", [code, label])
+                connection.execute("INSERT INTO mod.dim_indicator VALUES (?, ?, 1, current_timestamp)", [code, label])
                 for year in range(2018, 2025):
                     connection.execute(
-                        "INSERT INTO mod.dim_year VALUES (?, ?, make_date(?, 1, 1)) ON CONFLICT DO NOTHING",
+                        "INSERT INTO mod.dim_year VALUES (?, ?, make_date(?, 1, 1), 1, current_timestamp) ON CONFLICT DO NOTHING",
                         [str(year), f"{(year // 10) * 10}s", year],
                     )
                     connection.execute(
@@ -616,7 +658,15 @@ class StoreTests(unittest.TestCase):
             legacy.execute("INSERT INTO ing.run_observation_scope VALUES ('1', 'BRA', 'TEST', 2024)")
             legacy.execute("CREATE TABLE mod.dim_year (year INTEGER PRIMARY KEY, decade INTEGER NOT NULL, year_start DATE NOT NULL)")
             legacy.execute("INSERT INTO mod.dim_year VALUES (2024, 2020, DATE '2024-01-01')")
-            legacy.execute("CREATE TABLE mod.fact_indicator_observation (country_code VARCHAR NOT NULL, indicator_code VARCHAR NOT NULL, year INTEGER NOT NULL, value DOUBLE, observation_status VARCHAR NOT NULL, source_run_id VARCHAR NOT NULL, source_path VARCHAR NOT NULL, source_page INTEGER NOT NULL, source_record_index INTEGER, source_response_sha256 VARCHAR NOT NULL, source_url VARCHAR NOT NULL, fetched_at TIMESTAMP NOT NULL, PRIMARY KEY (country_code, indicator_code, year))")
+            legacy.execute("""CREATE TABLE mod.fact_indicator_observation (
+                country_code VARCHAR NOT NULL, indicator_code VARCHAR NOT NULL, year INTEGER NOT NULL,
+                value DOUBLE, observation_status VARCHAR NOT NULL, source_run_id VARCHAR NOT NULL,
+                source_path VARCHAR NOT NULL, source_page INTEGER NOT NULL, source_record_index INTEGER,
+                source_response_sha256 VARCHAR NOT NULL, source_url VARCHAR NOT NULL, fetched_at TIMESTAMP NOT NULL,
+                PRIMARY KEY (country_code, indicator_code, year),
+                FOREIGN KEY (country_code) REFERENCES mod.dim_country(country_code),
+                FOREIGN KEY (indicator_code) REFERENCES mod.dim_indicator(indicator_code),
+                FOREIGN KEY (year) REFERENCES mod.dim_year(year))""")
             legacy.execute("INSERT INTO mod.fact_indicator_observation VALUES ('BRA', 'TEST', 2024, 10.0, 'complete', 1, 'raw.json', 1, 0, 'hash', 'url', current_timestamp)")
             legacy.execute("CREATE VIEW stg.vw_indicator_observation AS SELECT year FROM ing.run_observation_scope")
             legacy.execute("CREATE VIEW prl.year_over_year AS SELECT year FROM mod.fact_indicator_observation")
@@ -641,6 +691,17 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(migrated.execute("SELECT year FROM ing.run_observation_scope").fetchone()[0], "2024")
             self.assertEqual(migrated.execute("SELECT year, decade, year_start FROM mod.dim_year").fetchone(), ("2024", "2020s", datetime(2024, 1, 1).date()))
             self.assertEqual(migrated.execute("SELECT year, value FROM mod.fact_indicator_observation").fetchone(), ("2024", 10.0))
+            for table_name, key_column, key_value in (
+                ("dim_country", "country_code", "BRA"),
+                ("dim_indicator", "indicator_code", "TEST"),
+                ("dim_year", "year", "2024"),
+            ):
+                audit = migrated.execute(
+                    f"SELECT run_id, load_start_date FROM mod.{table_name} WHERE {key_column} = ?",
+                    [key_value],
+                ).fetchone()
+                self.assertEqual(audit[0], 1)
+                self.assertIsNotNone(audit[1])
             fact_fks = migrated.execute(
                 """SELECT constraint_column_names, referenced_table, referenced_column_names
                    FROM duckdb_constraints()

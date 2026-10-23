@@ -17,13 +17,15 @@ SELECT
     o.source_record_index,
     o.source_response_sha256,
     o.source_url,
-    c.source_path AS country_metadata_source_path,
-    c.source_page AS country_metadata_source_page,
-    c.source_record_index AS country_metadata_source_record_index,
-    c.source_response_sha256 AS country_metadata_source_response_sha256,
-    c.source_url AS country_metadata_source_url
+    country_metadata.source_path AS country_metadata_source_path,
+    country_metadata.source_page AS country_metadata_source_page,
+    country_metadata.source_record_index AS country_metadata_source_record_index,
+    country_metadata.source_response_sha256 AS country_metadata_source_response_sha256,
+    country_metadata.source_url AS country_metadata_source_url
 FROM mod.fact_indicator_observation AS o
 JOIN mod.dim_country AS c USING (country_code)
+LEFT JOIN stg.vw_country_source AS country_metadata
+    ON country_metadata.run_id = c.run_id AND country_metadata.country_code = c.country_code
 JOIN mod.dim_indicator AS i USING (indicator_code)
 JOIN mod.dim_year AS y USING (year)
 WHERE o.observation_status <> 'complete'

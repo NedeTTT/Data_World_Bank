@@ -11,7 +11,7 @@ raw_dir = "data/raw"
 database_path = "data/world_bank.duckdb"
 reports_dir = "reports"
 
-countries = ["BRA", "CAN", "DEU", "GBR", "IND", "JPN", "MEX", "USA", "ZAF", "FRA","ESP","AUT","HUN"]
+countries = ["BRA", "CAN", "DEU", "GBR", "IND", "JPN", "MEX", "USA", "ZAF", "FRA","ESP","AUT"]
 
 [indicators]
 "SP.POP.TOTL" = "Population, total"
