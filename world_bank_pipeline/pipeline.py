@@ -4,7 +4,6 @@ import csv
 import hashlib
 import json
 import logging
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,28 +18,13 @@ from .store import initialize_database, persist_raw_layer, publish_staging
 LOGGER = logging.getLogger(__name__)
 
 
-def _format_run_id(timestamp: datetime) -> str:
-    return timestamp.strftime("%Y_%m_%d_%H:%M:%S")
-
-
-def _run_folder_name(run_id: str) -> str:
-    return run_id.replace(":", "-")
-
-
-def _new_run_id(connection: duckdb.DuckDBPyConnection) -> str:
-    while True:
-        run_id = _format_run_id(datetime.now(timezone.utc))
-        exists = connection.execute(
-            "SELECT COUNT(*) FROM sys.pipeline_runs WHERE run_id = ?", [run_id]
-        ).fetchone()[0]
-        if not exists:
-            return run_id
-        time.sleep(0.1)
+def _new_run_id(connection: duckdb.DuckDBPyConnection) -> int:
+    return int(connection.execute("SELECT nextval('sys.pipeline_run_id_seq')").fetchone()[0])
 
 
 def _archive_page(
     config: PipelineConfig,
-    run_id: str,
+    run_id: int,
     endpoint_type: str,
     country_code: str | None,
     indicator_code: str | None,
@@ -50,7 +34,7 @@ def _archive_page(
     request_key = country_code or "all"
     if indicator_code:
         request_key = f"{request_key}_{indicator_code.replace('.', '_')}"
-    run_folder = _run_folder_name(run_id)
+    run_folder = str(run_id)
     relative_path = Path(run_folder) / endpoint_type / request_key / f"page-{page.page_number}-{digest[:12]}.json"
     destination = config.raw_dir / relative_path
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -72,7 +56,7 @@ def _archive_page(
     return metadata
 
 
-def _fetch_and_archive(config: PipelineConfig, run_id: str, client: WorldBankClient):
+def _fetch_and_archive(config: PipelineConfig, run_id: int, client: WorldBankClient):
     receipts: list[dict] = []
     raw_country_rows: list[tuple] = []
     raw_observation_rows: list[tuple] = []

@@ -11,15 +11,16 @@ CREATE SCHEMA IF NOT EXISTS sys;
 CREATE SCHEMA IF NOT EXISTS stg;
 CREATE SCHEMA IF NOT EXISTS mod;
 CREATE SCHEMA IF NOT EXISTS prl;
+CREATE SEQUENCE IF NOT EXISTS sys.pipeline_run_id_seq START 1;
 CREATE TABLE IF NOT EXISTS sys.pipeline_runs (
-    run_id VARCHAR PRIMARY KEY,
+    run_id BIGINT PRIMARY KEY,
     started_at TIMESTAMP NOT NULL,
     finished_at TIMESTAMP,
     status VARCHAR NOT NULL,
     error_message VARCHAR
 );
 CREATE TABLE IF NOT EXISTS ing.raw_responses (
-    run_id VARCHAR NOT NULL,
+    run_id BIGINT NOT NULL,
     endpoint_type VARCHAR NOT NULL,
     country_code VARCHAR,
     indicator_code VARCHAR,
@@ -31,7 +32,7 @@ CREATE TABLE IF NOT EXISTS ing.raw_responses (
     PRIMARY KEY (run_id, raw_path)
 );
 CREATE TABLE IF NOT EXISTS ing.raw_country_metadata (
-    run_id VARCHAR NOT NULL,
+    run_id BIGINT NOT NULL,
     country_code VARCHAR NOT NULL,
     source_page INTEGER NOT NULL,
     source_record_index INTEGER NOT NULL,
@@ -43,7 +44,7 @@ CREATE TABLE IF NOT EXISTS ing.raw_country_metadata (
     PRIMARY KEY (run_id, country_code, source_page, source_record_index)
 );
 CREATE TABLE IF NOT EXISTS ing.raw_indicator_observations (
-    run_id VARCHAR NOT NULL,
+    run_id BIGINT NOT NULL,
     country_code VARCHAR NOT NULL,
     indicator_code VARCHAR NOT NULL,
     source_page INTEGER NOT NULL,
@@ -56,7 +57,7 @@ CREATE TABLE IF NOT EXISTS ing.raw_indicator_observations (
     PRIMARY KEY (run_id, country_code, indicator_code, source_page, source_record_index)
 );
 CREATE TABLE IF NOT EXISTS ing.run_observation_scope (
-    run_id VARCHAR NOT NULL,
+    run_id BIGINT NOT NULL,
     country_code VARCHAR NOT NULL,
     indicator_code VARCHAR NOT NULL,
     year VARCHAR NOT NULL,
@@ -74,7 +75,7 @@ CREATE TABLE IF NOT EXISTS mod.dim_country (
     capital_city VARCHAR,
     longitude DOUBLE,
     latitude DOUBLE,
-    source_run_id VARCHAR NOT NULL,
+    source_run_id BIGINT NOT NULL,
     source_path VARCHAR NOT NULL,
     source_page INTEGER NOT NULL,
     source_record_index INTEGER NOT NULL,
@@ -96,7 +97,7 @@ CREATE TABLE IF NOT EXISTS mod.fact_indicator_observation (
     year VARCHAR NOT NULL,
     value DOUBLE,
     observation_status VARCHAR NOT NULL CHECK (observation_status IN ('complete', 'incomplete', 'missing')),
-    source_run_id VARCHAR NOT NULL,
+    source_run_id BIGINT NOT NULL,
     source_path VARCHAR NOT NULL,
     source_page INTEGER NOT NULL,
     source_record_index INTEGER,
@@ -217,6 +218,7 @@ def initialize_database(database_path: str) -> duckdb.DuckDBPyConnection:
     _remove_materialized_staging_tables(connection)
     _migrate_year_columns(connection)
     _migrate_fact_foreign_keys(connection)
+    _restore_source_lineage(connection)
     connection.execute(STAGING_VIEWS)
     return connection
 
@@ -274,7 +276,7 @@ def _remove_materialized_staging_tables(connection: duckdb.DuckDBPyConnection) -
 def _migrate_year_columns(connection: duckdb.DuckDBPyConnection) -> None:
     definitions = {
         ("ing", "run_observation_scope"): (
-            "CREATE TABLE {target} (run_id VARCHAR NOT NULL, country_code VARCHAR NOT NULL, "
+            "CREATE TABLE {target} (run_id BIGINT NOT NULL, country_code VARCHAR NOT NULL, "
             "indicator_code VARCHAR NOT NULL, year VARCHAR NOT NULL, "
             "PRIMARY KEY (run_id, country_code, indicator_code, year))",
             "SELECT run_id, country_code, indicator_code, CAST(year AS VARCHAR) AS year FROM {source}",
@@ -287,7 +289,7 @@ def _migrate_year_columns(connection: duckdb.DuckDBPyConnection) -> None:
             "CREATE TABLE {target} (country_code VARCHAR NOT NULL, indicator_code VARCHAR NOT NULL, "
             "year VARCHAR NOT NULL, value DOUBLE, observation_status VARCHAR NOT NULL "
             "CHECK (observation_status IN ('complete', 'incomplete', 'missing')), "
-            "source_run_id VARCHAR NOT NULL, source_path VARCHAR NOT NULL, source_page INTEGER NOT NULL, "
+            "source_run_id BIGINT NOT NULL, source_path VARCHAR NOT NULL, source_page INTEGER NOT NULL, "
             "source_record_index INTEGER, source_response_sha256 VARCHAR NOT NULL, source_url VARCHAR NOT NULL, "
             "fetched_at TIMESTAMP NOT NULL, PRIMARY KEY (country_code, indicator_code, year))",
             "SELECT country_code, indicator_code, CAST(year AS VARCHAR) AS year, value, observation_status, "
@@ -406,7 +408,7 @@ def _migrate_fact_foreign_keys(connection: duckdb.DuckDBPyConnection) -> None:
                 observation_status VARCHAR NOT NULL CHECK (
                     observation_status IN ('complete', 'incomplete', 'missing')
                 ),
-                source_run_id VARCHAR NOT NULL,
+                source_run_id BIGINT NOT NULL,
                 source_path VARCHAR NOT NULL,
                 source_page INTEGER NOT NULL,
                 source_record_index INTEGER,
@@ -426,6 +428,103 @@ def _migrate_fact_foreign_keys(connection: duckdb.DuckDBPyConnection) -> None:
     except Exception:
         connection.execute("ROLLBACK")
         raise
+
+
+def _restore_source_lineage(connection: duckdb.DuckDBPyConnection) -> None:
+    if not _table_exists(connection, "mod", "dim_country"):
+        return
+
+    connection.execute("""
+        UPDATE mod.dim_country AS dimension
+        SET source_run_id = raw.run_id,
+            source_path = raw.source_path,
+            source_page = raw.source_page,
+            source_record_index = raw.source_record_index,
+            source_url = raw.source_url
+        FROM (
+            SELECT run_id, country_code, source_path, source_page, source_record_index,
+                   source_response_sha256, source_url
+            FROM ing.raw_country_metadata
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY country_code, source_response_sha256
+                ORDER BY run_id, source_page, source_record_index
+            ) = 1
+        ) AS raw
+        WHERE dimension.country_code = raw.country_code
+          AND dimension.source_response_sha256 = raw.source_response_sha256
+    """)
+
+    connection.execute("""
+        UPDATE mod.fact_indicator_observation AS fact
+        SET source_run_id = raw.run_id,
+            source_path = raw.source_path,
+            source_page = raw.source_page,
+            source_record_index = raw.source_record_index,
+            source_url = raw.source_url,
+            fetched_at = raw.fetched_at
+        FROM (
+            SELECT run_id, country_code, indicator_code,
+                   TRY_CAST(json_extract_string(payload_json, '$.date') AS VARCHAR) AS year,
+                   TRY_CAST(json_extract_string(payload_json, '$.value') AS DOUBLE) AS value,
+                   source_page, source_record_index, source_path, source_response_sha256,
+                   source_url, fetched_at
+            FROM ing.raw_indicator_observations
+            WHERE source_record_index IS NOT NULL
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY country_code, indicator_code,
+                             TRY_CAST(json_extract_string(payload_json, '$.date') AS VARCHAR),
+                             source_response_sha256
+                ORDER BY run_id, source_page, source_record_index
+            ) = 1
+        ) AS raw
+        WHERE fact.country_code = raw.country_code
+          AND fact.indicator_code = raw.indicator_code
+          AND fact.year = raw.year
+          AND fact.value IS NOT DISTINCT FROM raw.value
+          AND fact.source_response_sha256 = raw.source_response_sha256
+    """)
+
+    connection.execute("""
+        UPDATE mod.fact_indicator_observation AS fact
+        SET source_run_id = raw.run_id,
+            source_path = raw.raw_path,
+            source_page = raw.page_number,
+            source_record_index = NULL,
+            source_url = raw.request_url,
+            fetched_at = raw.fetched_at
+        FROM (
+            SELECT response.run_id, response.country_code, response.indicator_code,
+                   response.page_number, response.raw_path, response.response_sha256,
+                   response.request_url, response.fetched_at,
+                   scope.year
+            FROM ing.raw_responses AS response
+            JOIN ing.run_observation_scope AS scope
+              ON scope.run_id = response.run_id
+             AND scope.country_code = response.country_code
+             AND scope.indicator_code = response.indicator_code
+            WHERE response.endpoint_type = 'indicators'
+              AND response.page_number = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ing.raw_indicator_observations AS observation
+                  WHERE observation.run_id = response.run_id
+                    AND observation.country_code = response.country_code
+                    AND observation.indicator_code = response.indicator_code
+                    AND TRY_CAST(json_extract_string(observation.payload_json, '$.date') AS VARCHAR) = scope.year
+              )
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY response.country_code, response.indicator_code, scope.year,
+                             response.response_sha256
+                ORDER BY response.run_id, response.page_number
+            ) = 1
+        ) AS raw
+        WHERE fact.country_code = raw.country_code
+          AND fact.indicator_code = raw.indicator_code
+          AND fact.year = raw.year
+          AND fact.observation_status = 'missing'
+          AND fact.value IS NULL
+          AND fact.source_response_sha256 = raw.response_sha256
+    """)
 
 
 def _migrate_legacy_model_tables(connection: duckdb.DuckDBPyConnection) -> None:
@@ -550,12 +649,24 @@ def persist_raw_layer(
 
 def publish_staging(
     connection: duckdb.DuckDBPyConnection,
-    run_id: str,
+    run_id: int,
     indicators: dict[str, str],
     validator: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
 ) -> None:
     connection.execute("BEGIN TRANSACTION")
     try:
+        connection.execute(
+            """DELETE FROM mod.fact_indicator_observation AS fact
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM ing.run_observation_scope AS scope
+                WHERE scope.run_id = ?
+                  AND scope.country_code = fact.country_code
+                  AND scope.indicator_code = fact.indicator_code
+                  AND scope.year = fact.year
+            )""",
+            [run_id],
+        )
         connection.execute(
             """INSERT INTO mod.dim_country
             SELECT country_code, country_name, region_id, region_name, income_group_id,
@@ -572,11 +683,23 @@ def publish_staging(
                 longitude = excluded.longitude, latitude = excluded.latitude,
                 source_run_id = excluded.source_run_id, source_path = excluded.source_path,
                 source_page = excluded.source_page, source_record_index = excluded.source_record_index,
-                source_response_sha256 = excluded.source_response_sha256, source_url = excluded.source_url""",
+                source_response_sha256 = excluded.source_response_sha256, source_url = excluded.source_url
+            WHERE mod.dim_country.country_name IS DISTINCT FROM excluded.country_name
+               OR mod.dim_country.region_id IS DISTINCT FROM excluded.region_id
+               OR mod.dim_country.region_name IS DISTINCT FROM excluded.region_name
+               OR mod.dim_country.income_group_id IS DISTINCT FROM excluded.income_group_id
+               OR mod.dim_country.income_group_name IS DISTINCT FROM excluded.income_group_name
+               OR mod.dim_country.lending_type_id IS DISTINCT FROM excluded.lending_type_id
+               OR mod.dim_country.lending_type_name IS DISTINCT FROM excluded.lending_type_name
+               OR mod.dim_country.capital_city IS DISTINCT FROM excluded.capital_city
+               OR mod.dim_country.longitude IS DISTINCT FROM excluded.longitude
+               OR mod.dim_country.latitude IS DISTINCT FROM excluded.latitude""",
             [run_id],
         )
         connection.executemany(
-            "INSERT INTO mod.dim_indicator VALUES (?, ?) ON CONFLICT (indicator_code) DO UPDATE SET indicator_name = excluded.indicator_name",
+            """INSERT INTO mod.dim_indicator VALUES (?, ?)
+            ON CONFLICT (indicator_code) DO UPDATE SET indicator_name = excluded.indicator_name
+            WHERE mod.dim_indicator.indicator_name IS DISTINCT FROM excluded.indicator_name""",
             list(indicators.items()),
         )
         connection.execute(
@@ -600,7 +723,9 @@ def publish_staging(
                 source_run_id = excluded.source_run_id, source_path = excluded.source_path,
                 source_page = excluded.source_page, source_record_index = excluded.source_record_index,
                 source_response_sha256 = excluded.source_response_sha256,
-                source_url = excluded.source_url, fetched_at = excluded.fetched_at""",
+                source_url = excluded.source_url, fetched_at = excluded.fetched_at
+            WHERE mod.fact_indicator_observation.value IS DISTINCT FROM excluded.value
+               OR mod.fact_indicator_observation.observation_status IS DISTINCT FROM excluded.observation_status""",
             [run_id],
         )
         if validator:
