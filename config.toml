@@ -1,0 +1,20 @@
+[source]
+base_url = "https://api.worldbank.org/v2"
+timeout_seconds = 30
+max_retries = 4
+retry_backoff_seconds = 1.0
+
+[pipeline]
+start_year = 2018
+end_year = 2024
+raw_dir = "data/raw"
+database_path = "data/world_bank.duckdb"
+reports_dir = "reports"
+
+countries = ["BRA", "CAN", "DEU", "GBR", "IND", "JPN", "MEX", "USA", "ZAF", "ROU"]
+
+[indicators]
+"SP.POP.TOTL" = "Population, total"
+"NY.GDP.MKTP.CD" = "GDP, current US dollars"
+"NY.GDP.PCAP.CD" = "GDP per capita, current US dollars"
+"SP.DYN.LE00.IN" = "Life expectancy at birth, total years"

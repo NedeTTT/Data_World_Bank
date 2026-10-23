@@ -1,2 +1,125 @@
-# Data_World_Bank
-Take-Home Assessment
+# World Bank Indicators Pipeline
+
+A local, configuration-driven pipeline that retrieves country metadata and annual indicators from the public World Bank API, preserves the source responses, and publishes analytics-ready data to DuckDB.
+
+## Run locally
+
+Requirements: Python 3.11 or newer and PowerShell on Windows. No API account, API key, Docker, or cloud resources are required.
+
+```powershell
+.\run.ps1
+```
+
+From a clean checkout, this single command creates `.venv` if needed, installs `requirements.txt`, runs the configured pipeline, and writes CSV reports under `reports/`. Optional pipeline arguments can be passed through the script with `--config another-config.toml`. To run the offline test suite separately:
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The pipeline makes one metadata request per configured country and one indicator-series request per country/indicator pair. It follows World Bank pagination metadata, uses bounded exponential backoff for transient network errors and HTTP 408, 429, and 5xx failures, and records a failed run without publishing partial analytical data when retrieval or validation fails. Raw pages already fetched remain available for diagnosis and replay.
+
+Each run ID is a UTC timestamp in `yyyy_mm_dd_hh:mm:ss` format. Since Windows does not allow colons in directory names, the corresponding raw folder uses hyphens in place of the colons; the run ID stored in DuckDB and shown in logs retains the requested format.
+
+## Configuration and model
+
+Edit [config.toml](config.toml) to change the country list, indicator code/label fallback, year range, API retry behavior, or output locations. Adding an indicator or country does not require copying pipeline code. Indicator names are taken from each observation's World Bank API payload; the configured label is a fallback if the API omits it. The indicator definitions in this assessment are:
+
+| Code | Indicator |
+| --- | --- |
+| `SP.POP.TOTL` | Population, total |
+| `NY.GDP.MKTP.CD` | GDP, current US dollars |
+| `NY.GDP.PCAP.CD` | GDP per capita, current US dollars |
+| `SP.DYN.LE00.IN` | Life expectancy at birth, total years |
+
+To add a country, add its World Bank ISO3 code to `pipeline.countries`, for example `"FRA"`. To add an indicator, add its World Bank indicator code and fallback label under `[indicators]`, for example `"EN.ATM.CO2E.PC" = "CO2 emissions (metric tons per capita)"`. Keep the standard ISO3/World Bank indicator codes: the API payload remains the authoritative source for the returned country and indicator names. The configured country × indicator × year combinations define the expected observation scope; no pipeline code needs to be copied or edited.
+
+DuckDB contains five schemas: `sys` for pipeline operations, plus `ing`, `stg`, `mod`, and `prl` for the data flow. DuckDB owns the built-in `main` schema and does not support renaming it; application objects are not stored there.
+
+| Layer | Objects | Purpose and grain |
+| --- | --- | --- |
+| `sys` | `sys.pipeline_runs` | One row per pipeline run; operational status, timestamps, and error message. |
+| `ing` | `ing.raw_responses`, `ing.raw_country_metadata`, `ing.raw_indicator_observations`, `ing.run_observation_scope` | Immutable, run-scoped source layer. `raw_responses` grain: one API page/request. `raw_country_metadata`: one JSON country record per run/page/record index. `raw_indicator_observations`: one JSON observation per run/country/indicator/page/record index. `run_observation_scope`: one expected country/indicator/year key per run, including years the API may omit. |
+| `stg` | `stg.vw_current_run`, `stg.vw_country`, `stg.vw_indicator_observation`, `stg.vw_observation` | Non-persisted SQL views over `ing`. They choose the latest running/succeeded snapshot, parse JSON, standardize column names and types, deduplicate country and observation business keys, and create an expected-year row with explicit `missing`/`incomplete`/`complete` status. Failed runs do not replace the last valid snapshot. |
+| `mod` | `mod.fact_indicator_observation`, `mod.dim_country`, `mod.dim_indicator`, `mod.dim_year` | Curated star schema. The fact grain is one country + indicator + year; dimensions hold country, indicator, and calendar attributes. |
+| `prl` | `prl.missing_or_incomplete`, `prl.year_over_year`, `prl.latest_comparison`, `prl.income_group_comparison`, `prl.gdp_consistency` | Analyst-facing SQL views; CSV files are exported from these views into `reports/`. |
+
+### Grain, keys, and relationships
+
+The final analytical grain is exactly one observation for a country, indicator, and year. The fact business key and primary key is `(country_code, indicator_code, year)`; these are natural keys taken from the World Bank ISO3 code, indicator code, and year. `mod.dim_country.country_code`, `mod.dim_indicator.indicator_code`, and `mod.dim_year.year` are the respective dimension primary keys. The fact has three enforced foreign keys:
+
+```text
+mod.dim_country.country_code       1 ─── * mod.fact_indicator_observation.country_code
+mod.dim_indicator.indicator_code  1 ─── * mod.fact_indicator_observation.indicator_code
+mod.dim_year.year                  1 ─── * mod.fact_indicator_observation.year
+```
+
+Country metadata is one row per country in the current model; indicator metadata is one row per indicator; the year dimension is one row per year. The country dimension contains region, income-group, lending-type, capital-city, and coordinate attributes. The indicator dimension contains the API indicator code and API name. The year dimension has `year` as its text key (so clients display `2024`, not `2,024`), `decade` as a label such as `2020s`, and `year_start` as a real `DATE` for date operations. Fact values remain numeric. Country income group is the current API classification applied to the requested historical observations, not a historical classification series.
+
+The raw-to-analytics mapping is explicit: API response pages are archived unchanged in `data/raw/` and indexed in `ing.raw_responses`; each JSON record is retained with request/page/record/hash lineage in its area-specific raw table. `stg.vw_country` extracts nested country attributes, `stg.vw_indicator_observation` extracts and types observation year/value, and `stg.vw_observation` joins those observations to the configured run scope to represent API-omitted years. The staging views expose normalized names and deduplicated keys; the `INSERT ... SELECT` into `mod` converts only what is needed for the model while carrying source lineage onto the fact.
+
+Staging selects the latest running or succeeded run and deduplicates countries by `country_code` and observations by `(country_code, indicator_code, year)`, keeping the latest fetched row and then the lowest page/record index deterministically. A later failed run is ignored, so analysts continue to see the most recent valid snapshot. The raw layer retains all records and runs for audit. Re-runs upsert on the fact business key: unchanged source data does not add analytical duplicates, while a corrected API value replaces the current analytical value. Raw payloads remain available by run for lineage and replay; staging is derived on query.
+
+All explicit `year` columns across `ing`, `stg`, and `mod` use `VARCHAR`, so database clients display `2024` without locale-based thousands separators. `mod.dim_year.year_start` and the `year_start` fields in `stg`/`prl` are true `DATE` values (January 1 of that year) for calendar operations. `mod.dim_year.decade` is a display label such as `2020s`. SQL ordering remains correct for four-digit ISO years, and indicator values remain numeric. The initialization migration converts legacy integer year keys to text while preserving rows and primary keys.
+
+Missingness is explicit: `complete` means an API record with a value; `incomplete` means the API returned that year with a null value; `missing` means the API returned no record for that year. All three states appear in the expected year/country/indicator grid. Missing values remain SQL `NULL`, never zero.
+
+## Lineage and outputs
+
+Raw response bodies are saved as received under `data/raw/<run_id>/`, with an append-only `manifest.jsonl` containing the request URL, fetch timestamp, page number, and SHA-256. Each record in `ing.raw_country_metadata` and `ing.raw_indicator_observations` retains its JSON payload and the source page/file/hash/URL. `stg` and `mod.fact_indicator_observation` carry that lineage forward. For an API-omitted year, staging records a missing row linked to the paginated series response that established the absence. Reporting views retain lineage too: direct-value reports include observation and country-metadata path/page/record/hash/URL; YoY includes current and prior-year observation sources; income-group aggregates list contributing observation and country-metadata sources; and the GDP consistency report identifies each indicator input and country-metadata source.
+
+DuckDB is stored at `data/world_bank.duckdb`. SQL definitions in `sql/` create persistent views in `prl` and produce:
+
+| Report | Contents |
+| --- | --- |
+| `missing_or_incomplete.csv` | Expected country/indicator/year keys with a non-complete status or a `NULL` value, with source lineage and a quality flag if status says complete while value is null |
+| `year_over_year.csv` | Previous-year value, absolute change, and percent change |
+| `latest_comparison.csv` | All configured countries for the latest year with a value for each indicator |
+| `income_group_comparison.csv` | Annual average, median, min/max, and available-country count by current income group |
+| `gdp_consistency.csv` | GDP versus GDP-per-capita × population comparison and review flag |
+
+YoY absolute change is null if either year is unavailable. Percent change is additionally null when the prior value is zero. The income group comes from current World Bank country metadata, so it is a current classification applied across the historical years, not a historical income-group series. The GDP cross-check is a review signal with a 10% threshold, not a hard equality assertion, because source definitions, rounding, and revisions can differ.
+
+CSV examples are committed in `reports/` after running the pipeline. SQL is also directly queryable in DuckDB for custom analysis.
+
+## Data quality and tests
+
+Automated checks run inside the staging-to-model transaction before it commits:
+
+- The fact row count matches the configured country × indicator × year scope.
+- The fact business key `(country_code, indicator_code, year)` is unique; the database primary key enforces this as well.
+- `complete` observations have a non-null value, and `missing`/`incomplete` observations do not have a value.
+- Every fact resolves to country, indicator, and year dimensions; database foreign keys independently enforce these relationships.
+- Each fact's raw source file exists on disk.
+- GDP is checked against GDP per capita × population for each country/year. A relative difference above 10% emits a review warning; it does not fail the load because source definitions, revisions, and rounding can differ.
+
+The offline `unittest` suite does not call the live API. It covers API pagination with fixtures, retries for HTTP 408/503 and no retry for permanent 400, indicator-name extraction/fallback, raw-to-staging-to-model idempotency, deduplication, latest-valid-run selection, missing/incomplete semantics, rejection of `complete + NULL`, the GDP consistency warning, year-type migration, primary/foreign-key enforcement, lineage in reports, and execution/layout of all presentation views.
+
+## Decisions and trade-offs
+
+- Python's standard library handles TOML, HTTP, retries, hashing, and CSV, keeping the runtime dependency set small; DuckDB provides a portable analytical database with SQL and no server process.
+- The request is a bounded historical refresh rather than a date-based incremental cursor. That is appropriate for a seven-year take-home dataset and also detects corrected values on every rerun.
+- All pages are archived before analytical publication. A failed run may leave an incomplete raw run directory, but its run status is `failed` and no partial observation batch is committed.
+- The source is queried country-by-country and indicator-by-indicator. This is easy to trace and isolates failures, at the cost of more HTTP requests than a multi-country request.
+
+## Timebox and remaining work
+
+The implementation took 6 hours, matching the assessment's suggested 4–6 hour timebox. All required deliverables are implemented: configurable ingestion, raw/staging/model/presentation layers, idempotent fact loading, data-quality checks, offline tests, reporting views and sample CSVs, local setup instructions, and the production design note. No required item is intentionally left unfinished.
+
+The following are production-hardening follow-ups, not blockers for the take-home scope:
+
+- Add historical income-group classifications if analysts need the group that applied in each observation year; the current World Bank country metadata is a current classification.
+- Add automated live-source drift monitoring and alerts; test execution remains offline and deterministic.
+- Add concurrent-run coordination and atomic report-file publication for scheduled multi-process operation.
+- Add retention/cleanup policy for immutable raw snapshots and a versioned history of corrected facts if audit requirements call for it.
+
+## Production design note
+
+- **Scheduling and refresh:** Run daily or weekly through Airflow/MWAA, Dagster, or a cloud scheduler. Use a rolling recent-year refresh for normal operation and periodically re-read the full retained range to detect source corrections. Watermarks are useful for newly published years but must not be the only refresh strategy.
+- **Late and corrected data:** Keep immutable, dated raw snapshots and checksums. Upsert the current fact table by business key, compare hashes/values to the prior version, and retain a change history or snapshot table for audit. Recompute dependent aggregates when a source value changes.
+- **Monitoring and alerting:** Emit run status, duration, request/retry counts, row counts, source hashes, missingness rates, and DQ outcomes as structured metrics. Alert on failed runs, unusual missingness changes, schema/API shape changes, and consistency-check breaches. Do not promote an unvalidated batch.
+- **Backfills and replay:** Parameterize country, indicator, and date ranges; store raw responses in object storage by run and request. A backfill can replay archived pages without API calls, or re-fetch a selected range and reconcile by the same business key. Record code/config version with each run.
+- **Cloud mapping:** Store raw JSON in S3 (or Azure Data Lake Storage), partitioned by dataset/run/date. AWS Glue or EMR can perform distributed transformations; Snowflake stores curated dimensions/facts and serves SQL reporting. Orchestrate with MWAA/Step Functions. On Azure, use ADLS + Data Factory and Databricks/Synapse, with the same raw/clean/analytics boundaries and idempotent keys. Secrets management is unnecessary for this public source, but credentials for downstream systems belong in a managed secret store.
+
+## AI usage
+
+AI assistance was used to scaffold the pipeline structure, SQL reports, tests, and documentation. The implementation and assumptions were reviewed against the assessment requirements; tests use deterministic fixtures, and production API results should still be checked for source-specific revisions and metadata changes.
