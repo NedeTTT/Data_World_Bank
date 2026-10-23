@@ -130,7 +130,14 @@ Proj structure and model
     ├── latest_comparison
     ├── income_group_comparison
     └── gdp_consistency
-```
+## Implementation summary
+
+- `ing`: immutable API pages, hashes, and expected observation scope.
+- `sys`: sequential run IDs and run history; ingestion counts/NULL profiles are exported to `reports/ingestion_quality.csv`.
+- `stg`: typed, deduplicated views and explicit missing/incomplete status.
+- `mod`: star schema / 3 dimensions and 1 fact.
+- `prl`: five SQL reporting views exported as CSV.
+- Quality/tests: transactional model checks and 18 offline tests; `run.ps1` runs tests only after a successful pipeline.
 
 ### Grain, keys, and relationships
 
@@ -184,14 +191,6 @@ The offline `unittest` suite does not call the live API. It covers API paginatio
 
 For a plain-language explanation of each runtime check and each offline test, see [DATA_QUALITY_AND_TESTS.md](DATA_QUALITY_AND_TESTS.md).
 
-## Implementation summary
-
-- `ing`: immutable API pages, hashes, and expected observation scope.
-- `sys`: sequential run IDs and run history; ingestion counts/NULL profiles are exported to `reports/ingestion_quality.csv`.
-- `stg`: typed, deduplicated views and explicit missing/incomplete status.
-- `mod`: star schema; dimensions share `run_id` and `load_start_date`, while facts retain source lineage.
-- `prl`: five SQL reporting views exported as CSV.
-- Quality/tests: transactional model checks and 18 offline tests; `run.ps1` runs tests only after a successful pipeline.
 
 ## Decisions and trade-offs
 
